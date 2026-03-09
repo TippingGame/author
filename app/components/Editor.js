@@ -56,11 +56,30 @@ const Editor = forwardRef(function Editor({ content, onUpdate, editable = true, 
         }
         return { x: 96, y: 96 };
     });
+    const [aiAutoComplete, setAiAutoComplete] = useState(() => {
+        if (typeof window !== 'undefined') {
+            const enabledRaw = localStorage.getItem('author-ai-autocomplete-enabled');
+            const delayRaw = parseInt(localStorage.getItem('author-ai-autocomplete-delay') || '', 10);
+            const maxCharsRaw = parseInt(localStorage.getItem('author-ai-autocomplete-maxchars') || '', 10);
+            return {
+                enabled: enabledRaw == null ? true : enabledRaw === 'true',
+                delay: Number.isFinite(delayRaw) ? Math.min(4000, Math.max(800, delayRaw)) : 1200,
+                maxChars: Number.isFinite(maxCharsRaw) ? Math.min(2000, Math.max(20, maxCharsRaw)) : 90,
+            };
+        }
+        return { enabled: true, delay: 1200, maxChars: 90 };
+    });
 
     // 边距变更自动保存
     useEffect(() => {
         localStorage.setItem('author-margins', JSON.stringify(margins));
     }, [margins]);
+
+    useEffect(() => {
+        localStorage.setItem('author-ai-autocomplete-enabled', String(aiAutoComplete.enabled));
+        localStorage.setItem('author-ai-autocomplete-delay', String(aiAutoComplete.delay));
+        localStorage.setItem('author-ai-autocomplete-maxchars', String(aiAutoComplete.maxChars));
+    }, [aiAutoComplete]);
 
     const editor = useEditor({
         immediatelyRender: false,
@@ -223,7 +242,13 @@ const Editor = forwardRef(function Editor({ content, onUpdate, editable = true, 
 
     return (
         <>
-            <EditorToolbar editor={editor} margins={margins} setMargins={setMargins} />
+            <EditorToolbar
+                editor={editor}
+                margins={margins}
+                setMargins={setMargins}
+                aiAutoComplete={aiAutoComplete}
+                setAiAutoComplete={setAiAutoComplete}
+            />
             <div
                 className="editor-container"
                 onMouseDown={(e) => {
@@ -309,8 +334,18 @@ const Editor = forwardRef(function Editor({ content, onUpdate, editable = true, 
                 </div>
             </div>
             <FindBar editor={editor} visible={findBarVisible} onClose={() => setFindBarVisible(false)} />
-            <InlineAI editor={editor} onAiRequest={onAiRequest} onArchiveGeneration={onArchiveGeneration} contextItems={contextItems} contextSelection={contextSelection} setContextSelection={setContextSelection} />
-            <StatusBar editor={editor} pageCount={pageCount} />
+            <InlineAI
+                editor={editor}
+                onAiRequest={onAiRequest}
+                onArchiveGeneration={onArchiveGeneration}
+                contextItems={contextItems}
+                contextSelection={contextSelection}
+                setContextSelection={setContextSelection}
+                autoCompleteEnabled={aiAutoComplete.enabled}
+                autoCompleteDelay={aiAutoComplete.delay}
+                autoCompleteMaxChars={aiAutoComplete.maxChars}
+            />
+            <StatusBar editor={editor} pageCount={pageCount} aiAutoComplete={aiAutoComplete} />
         </>
     );
 });
@@ -522,7 +557,7 @@ function FindBar({ editor, visible, onClose }) {
 }
 
 // ==================== Inline AI 组件 ====================
-function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, contextSelection, setContextSelection }) {
+function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, contextSelection, setContextSelection, autoCompleteEnabled, autoCompleteDelay, autoCompleteMaxChars }) {
     const { setShowSettings, setJumpToNodeId } = useAppStore();
     const [visible, setVisible] = useState(false);
     const [mode, setMode] = useState('continue');
@@ -537,19 +572,53 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
     const typingRef = useRef(false);
     // Ghost text tracking
     const ghostStartRef = useRef(null);
+    const ghostEndRef = useRef(null);
     const ghostTextRef = useRef('');
     // Rewrite backup
     const originalTextRef = useRef(null);
     const originalRangeRef = useRef(null);
+    const originalSliceRef = useRef(null);
     const currentModeRef = useRef('continue');
+    const generationAnchorRef = useRef(null);
     // 文档快照：生成前保存，拒绝时恢复
     const savedDocRef = useRef(null);
+    const autoTimerRef = useRef(null);
+    const autoTriggeredRef = useRef(false);
+    const activeAutocompleteRef = useRef(false);
+    const lastAutoSignatureRef = useRef('');
+    const suppressAutoUntilRef = useRef(0);
+    const composingRef = useRef(false);
     // ===== Chat Q&A 状态 =====
     const [chatMessages, setChatMessages] = useState([]); // [{role:'user'|'assistant', content}]
     const [chatStreaming, setChatStreaming] = useState(false);
     const [chatAnswer, setChatAnswer] = useState('');
     const chatPanelRef = useRef(null);
     const chatInputRef = useRef(null);
+
+    const clearAutoTimer = useCallback(() => {
+        if (autoTimerRef.current) {
+            clearTimeout(autoTimerRef.current);
+            autoTimerRef.current = null;
+        }
+    }, []);
+
+    const suppressAutoTrigger = useCallback((ms = 1600) => {
+        suppressAutoUntilRef.current = Date.now() + ms;
+        clearAutoTimer();
+    }, [clearAutoTimer]);
+
+    const getScrollContainer = useCallback(() => {
+        return editor?.view?.dom?.closest('.editor-container') || null;
+    }, [editor]);
+
+    const restoreScrollPosition = useCallback((scrollTop) => {
+        const container = getScrollContainer();
+        if (!container || scrollTop == null) return;
+        container.scrollTop = scrollTop;
+        requestAnimationFrame(() => {
+            if (container) container.scrollTop = scrollTop;
+        });
+    }, [getScrollContainer]);
 
     // 获取选中文本
     const getSelectedText = useCallback(() => {
@@ -560,9 +629,13 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
     }, [editor]);
 
     // 获取上文（用于续写）
-    const getContextText = useCallback(() => {
+    const getContextText = useCallback((anchorPos = null) => {
         if (!editor) return '';
-        const text = editor.getText();
+        if (anchorPos == null) {
+            const text = editor.getText();
+            return text.length > 1500 ? text.slice(-1500) : text;
+        }
+        const text = editor.state.doc.textBetween(0, anchorPos, '\n', '\0');
         return text.length > 1500 ? text.slice(-1500) : text;
     }, [editor]);
 
@@ -590,26 +663,80 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         setPosition({ top, left });
     }, [editor]);
 
+    const getAutoSignature = useCallback(() => {
+        if (!editor) return '';
+        const head = editor.state.selection.head;
+        const before = editor.state.doc.textBetween(Math.max(0, head - 220), head, '\n', '\0')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const after = editor.state.doc.textBetween(head, Math.min(editor.state.doc.content.size, head + 120), '\n', '\0')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return `${head}:${before.slice(-120)}|${after.slice(0, 80)}`;
+    }, [editor]);
+
+    const getCompletionContext = useCallback((anchorPos = null) => {
+        if (!editor) return { prefix: '', suffix: '', fullPrefix: '', fullSuffix: '', isInfill: false };
+        const head = anchorPos ?? editor.state.selection.head;
+        const fullPrefix = editor.state.doc.textBetween(0, head, '\n', '\0');
+        const fullSuffix = editor.state.doc.textBetween(head, editor.state.doc.content.size, '\n', '\0');
+        return {
+            prefix: fullPrefix.slice(-1200),
+            suffix: fullSuffix.slice(0, 700),
+            fullPrefix,
+            fullSuffix,
+            isInfill: fullSuffix.trim().length > 0,
+        };
+    }, [editor]);
+
+    const shouldAutoTrigger = useCallback(() => {
+        if (!autoCompleteEnabled || !editor) return false;
+        if (visible || pendingGhost || streaming || chatStreaming || composingRef.current) return false;
+        if (Date.now() < suppressAutoUntilRef.current) return false;
+
+        const { from, to, empty } = editor.state.selection;
+        if (!empty || from !== to) return false;
+
+        const head = editor.state.selection.head;
+        const before = editor.state.doc.textBetween(Math.max(0, head - 260), head, '\n', '\0');
+        const after = editor.state.doc.textBetween(head, Math.min(editor.state.doc.content.size, head + 120), '\n', '\0');
+        const trimmedBefore = before.replace(/\s+/g, ' ').trim();
+        const trimmedAfter = after.replace(/\s+/g, '');
+
+        if (trimmedBefore.length < 12) return false;
+        if (trimmedAfter.length > 0 && trimmedAfter.length < 2 && /[\s，。！？、,.;:]/.test(trimmedAfter)) return false;
+
+        const lastChar = trimmedBefore.slice(-1);
+        if (!lastChar || /[（(\[{【“‘]$/.test(lastChar)) return false;
+
+        const signature = getAutoSignature();
+        if (!signature || signature === lastAutoSignatureRef.current) return false;
+        return true;
+    }, [autoCompleteEnabled, chatStreaming, editor, getAutoSignature, pendingGhost, streaming, visible]);
+
     // 打开浮窗
     const open = useCallback(() => {
         if (pendingGhost) return; // 有待确认的 ghost 时不打开新的
+        suppressAutoTrigger();
         const selected = getSelectedText();
         setMode(selected ? 'rewrite' : 'continue');
         setInstruction('');
         updatePosition();
         setVisible(true);
-    }, [getSelectedText, updatePosition, pendingGhost]);
+    }, [getSelectedText, pendingGhost, suppressAutoTrigger, updatePosition]);
 
     // 关闭浮窗
     const close = useCallback(() => {
         if (streaming || pendingGhost) return;
+        suppressAutoTrigger(1000);
         setVisible(false);
         setInstruction('');
         editor?.chain().focus().run();
-    }, [streaming, pendingGhost, editor]);
+    }, [streaming, pendingGhost, editor, suppressAutoTrigger]);
 
     // 停止生成
     const stop = useCallback(() => {
+        suppressAutoTrigger();
         if (abortRef.current) {
             abortRef.current.abort();
             abortRef.current = null;
@@ -621,7 +748,7 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         if (ghostTextRef.current) {
             setPendingGhost(true);
         }
-    }, []);
+    }, [suppressAutoTrigger]);
 
     // 打字机效果：逐字符插入编辑器，带 ghost mark
     // 使用原生 ProseMirror transaction，彻底避免 scrollIntoView
@@ -637,24 +764,28 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
                 return;
             }
             const char = typeQueueRef.current.shift();
+            const insertPos = ghostEndRef.current ?? ghostStartRef.current ?? editor.state.selection.from;
             if (char === '\n') {
                 if (typeQueueRef.current[0] !== '\n') {
                     // 换行：使用原生 split，不调用 scrollIntoView
                     ghostTextRef.current += '\n';
                     const { state } = editor.view;
-                    const tr = state.tr.split(state.selection.from);
+                    const tr = state.tr.split(insertPos);
+                    const nextPos = tr.mapping.map(insertPos, 1);
                     editor.view.dispatch(tr);
+                    ghostEndRef.current = nextPos;
                 }
             } else {
                 // 用原生 ProseMirror transaction 插入字符 + 标记 ghost
                 const { state } = editor.view;
-                const tr = state.tr.insertText(char);
+                const tr = state.tr.insertText(char, insertPos, insertPos);
                 const ghostMark = state.schema.marks.ghostText.create();
-                const to = tr.selection.from;
-                const from = to - char.length;
+                const from = insertPos;
+                const to = insertPos + char.length;
                 tr.addMark(from, to, ghostMark);
                 // 故意不调用 tr.scrollIntoView() — 防止滚动跳回
                 editor.view.dispatch(tr);
+                ghostEndRef.current = tr.mapping.map(insertPos, 1);
                 ghostTextRef.current += char;
             }
             requestAnimationFrame(() => setTimeout(typeNext, 20));
@@ -674,6 +805,7 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
 
     // 接受：去掉 ghost mark，文本变成正式内容
     const acceptGhost = useCallback(() => {
+        suppressAutoTrigger();
         editor?.commands.acceptAllGhost();
         // 归档
         onArchiveGeneration?.({
@@ -684,15 +816,22 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         });
         ghostTextRef.current = '';
         ghostStartRef.current = null;
+        ghostEndRef.current = null;
         originalTextRef.current = null;
         originalRangeRef.current = null;
+        originalSliceRef.current = null;
         setPendingGhost(false);
         setVisible(false);
         editor?.chain().focus().run();
-    }, [editor, instruction, onArchiveGeneration]);
+    }, [editor, instruction, onArchiveGeneration, suppressAutoTrigger]);
 
     // 拒绝：删除 ghost 文本（含换行符），改写模式还原原文
     const rejectGhost = useCallback(() => {
+        suppressAutoTrigger();
+        const preservedScrollTop = getScrollContainer()?.scrollTop ?? null;
+        const preservedOriginalText = originalTextRef.current;
+        const preservedOriginalRange = originalRangeRef.current;
+        const preservedOriginalSlice = originalSliceRef.current;
         // 归档（标记为拒绝）
         onArchiveGeneration?.({
             mode: currentModeRef.current,
@@ -700,50 +839,26 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
             text: ghostTextRef.current,
             status: 'rejected',
         });
-        // 直接恢复生成前的文档快照（最可靠，彻底消除残留空行）
-        if (savedDocRef.current && editor) {
-            editor.commands.setContent(savedDocRef.current, false);
-        } else {
-            // 回退：若无快照，使用 mark 删除
-            editor?.commands.removeAllGhost(ghostStartRef.current);
-            if (originalTextRef.current && originalRangeRef.current) {
-                const { from } = originalRangeRef.current;
-                editor?.chain()
-                    .focus()
-                    .insertContentAt(from, originalTextRef.current)
-                    .run();
-            }
+        editor?.commands.removeAllGhost(ghostStartRef.current);
+        if (preservedOriginalSlice && preservedOriginalRange) {
+            const insertTr = editor.state.tr.replace(
+                preservedOriginalRange.from,
+                preservedOriginalRange.from,
+                preservedOriginalSlice,
+            );
+            editor.view.dispatch(insertTr);
         }
+        restoreScrollPosition(preservedScrollTop);
         ghostTextRef.current = '';
         ghostStartRef.current = null;
+        ghostEndRef.current = null;
         originalTextRef.current = null;
         originalRangeRef.current = null;
+        originalSliceRef.current = null;
         savedDocRef.current = null;
         setPendingGhost(false);
         setVisible(false);
-        editor?.chain().focus().run();
-    }, [editor, instruction, onArchiveGeneration]);
-
-    // 重新生成：拒绝当前 ghost + 重新 generate
-    const regenerate = useCallback(() => {
-        // 先归档拒绝
-        onArchiveGeneration?.({
-            mode: currentModeRef.current,
-            instruction: instruction.trim(),
-            text: ghostTextRef.current,
-            status: 'rejected',
-        });
-        // 恢复文档快照
-        if (savedDocRef.current && editor) {
-            editor.commands.setContent(savedDocRef.current, false);
-        } else {
-            editor?.commands.removeAllGhost(ghostStartRef.current);
-        }
-        ghostTextRef.current = '';
-        setPendingGhost(false);
-        // 触发新一轮生成（savedDocRef 保留不清空，供下次拒绝使用）
-        setTimeout(() => generate(), 50);
-    }, [editor, instruction, onArchiveGeneration]);
+    }, [editor, getScrollContainer, instruction, onArchiveGeneration, restoreScrollPosition, suppressAutoTrigger]);
 
     // 执行 AI 生成
     // ===== Chat Q&A 生成（不修改原文） =====
@@ -787,27 +902,52 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         }
     }, [onAiRequest, chatStreaming, getContextText]);
 
-    const generate = useCallback(async () => {
+    const generate = useCallback(async ({
+        forcedMode = null,
+        forcedInstruction = null,
+        autoTriggered = false,
+        skipReveal = false,
+        restoreScrollTop = null,
+        forcedAnchorPos = null,
+        forcedSelectedText = null,
+        forcedSelectionRange = null,
+    } = {}) => {
         if (!onAiRequest || streaming) return;
 
+        const nextMode = forcedMode || mode;
+        const nextInstruction = forcedInstruction ?? instruction;
+
         // Chat 模式走独立路径
-        if (mode === 'chat') {
-            generateChat(instruction);
+        if (nextMode === 'chat') {
+            generateChat(nextInstruction);
             setInstruction('');
             return;
         }
 
-        const selectedText = getSelectedText();
-        const contextText = getContextText();
-        let actualMode = mode;
+        const selectedText = forcedSelectedText ?? getSelectedText();
+        const activeSelectionRange = forcedSelectionRange || editor.state.selection;
+        const anchorPos = forcedAnchorPos ?? (
+            selectedText && nextMode !== 'continue'
+                ? activeSelectionRange.from
+                : editor.state.selection.head
+        );
+        const contextText = getContextText(anchorPos);
+        const completionContext = !selectedText ? getCompletionContext(anchorPos) : null;
+        let actualMode = nextMode;
+        autoTriggeredRef.current = autoTriggered;
 
-        if (AI_MODES.find(m => m.key === mode)?.needsSelection && !selectedText) {
+        if (AI_MODES.find(m => m.key === nextMode)?.needsSelection && !selectedText) {
             actualMode = 'continue';
-            setMode('continue');
+            if (!autoTriggered) setMode('continue');
         }
         currentModeRef.current = actualMode;
+        generationAnchorRef.current = anchorPos;
 
-        const text = selectedText || contextText;
+        const requestMode = actualMode === 'continue' && completionContext ? 'autocomplete' : actualMode;
+        activeAutocompleteRef.current = requestMode === 'autocomplete';
+        const text = selectedText || (requestMode === 'autocomplete'
+            ? `${completionContext.prefix}${completionContext.suffix ? '\n[补全点]\n' + completionContext.suffix : ''}`
+            : contextText);
         if (!text.trim() && actualMode !== 'continue') return;
 
         setStreaming(true);
@@ -822,23 +962,31 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
 
         // 改写模式：备份原文
         if (selectedText && actualMode !== 'continue') {
-            const { from, to } = editor.state.selection;
+            const { from, to } = activeSelectionRange;
             originalTextRef.current = selectedText;
             originalRangeRef.current = { from, to };
-            editor?.chain().focus().deleteSelection().run();
+            originalSliceRef.current = editor.state.doc.slice(from, to);
+            const tr = editor.state.tr.delete(from, to);
+            editor.view.dispatch(tr);
         } else {
             originalTextRef.current = null;
             originalRangeRef.current = null;
-            editor?.chain().focus().run();
+            originalSliceRef.current = null;
         }
 
-        ghostStartRef.current = editor.state.selection.head;
+        ghostStartRef.current = anchorPos;
+        ghostEndRef.current = ghostStartRef.current;
+        if (restoreScrollTop != null) {
+            restoreScrollPosition(restoreScrollTop);
+        }
 
         try {
             await onAiRequest({
-                mode: actualMode,
+                mode: requestMode,
                 text,
-                instruction: instruction.trim(),
+                instruction: nextInstruction.trim(),
+                completionContext: requestMode === 'autocomplete' ? completionContext : null,
+                maxChars: requestMode === 'autocomplete' ? autoCompleteMaxChars : null,
                 signal: controller.signal,
                 onChunk: (chunk) => {
                     enqueueText(chunk);
@@ -858,32 +1006,149 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
             });
             setStreaming(false);
             abortRef.current = null;
+            autoTriggeredRef.current = false;
+            activeAutocompleteRef.current = false;
             // 进入待确认状态
             if (ghostTextRef.current) {
                 setPendingGhost(true);
-                // 将光标（ghost 文本末端）滚入可视区域，确保操作栏可见
-                try {
-                    const scrollContainer = editor.view.dom.closest('.editor-container');
-                    if (scrollContainer) {
-                        const head = editor.state.selection.head;
-                        const coords = editor.view.coordsAtPos(head, -1);
-                        const containerRect = scrollContainer.getBoundingClientRect();
-                        const relativeBottom = coords.bottom - containerRect.top + scrollContainer.scrollTop;
-                        const targetScroll = relativeBottom - containerRect.height + 80;
-                        if (targetScroll > scrollContainer.scrollTop) {
-                            scrollContainer.scrollTop = targetScroll;
+                if (restoreScrollTop != null) {
+                    restoreScrollPosition(restoreScrollTop);
+                }
+                if (!skipReveal) {
+                    // 将光标（ghost 文本末端）滚入可视区域，确保操作栏可见
+                    try {
+                        const scrollContainer = getScrollContainer();
+                        if (scrollContainer) {
+                            const head = ghostEndRef.current ?? ghostStartRef.current ?? editor.state.selection.head;
+                            const coords = editor.view.coordsAtPos(head, -1);
+                            const containerRect = scrollContainer.getBoundingClientRect();
+                            const relativeBottom = coords.bottom - containerRect.top + scrollContainer.scrollTop;
+                            const targetScroll = relativeBottom - containerRect.height + 80;
+                            if (targetScroll > scrollContainer.scrollTop) {
+                                scrollContainer.scrollTop = targetScroll;
+                            }
                         }
-                    }
-                } catch { /* 回退：不滚动也不阻塞 */ }
+                    } catch { /* 回退：不滚动也不阻塞 */ }
+                }
             } else {
+                ghostStartRef.current = null;
+                ghostEndRef.current = null;
                 setVisible(false);
             }
         }
-    }, [onAiRequest, streaming, mode, instruction, getSelectedText, getContextText, editor, enqueueText, updatePosition, generateChat]);
+    }, [onAiRequest, streaming, mode, instruction, getSelectedText, getContextText, getCompletionContext, editor, enqueueText, generateChat, autoCompleteMaxChars, getScrollContainer, restoreScrollPosition]);
+
+    // 重新生成：拒绝当前 ghost + 重新 generate
+    const regenerate = useCallback(() => {
+        suppressAutoTrigger();
+        const preservedScrollTop = getScrollContainer()?.scrollTop ?? null;
+        const anchorPos = generationAnchorRef.current ?? ghostStartRef.current;
+        const preservedMode = currentModeRef.current;
+        const preservedInstruction = instruction.trim();
+        const preservedOriginalText = originalTextRef.current;
+        const preservedOriginalRange = originalRangeRef.current;
+        const preservedOriginalSlice = originalSliceRef.current;
+        // 先归档拒绝
+        onArchiveGeneration?.({
+            mode: preservedMode,
+            instruction: preservedInstruction,
+            text: ghostTextRef.current,
+            status: 'rejected',
+        });
+        editor?.commands.removeAllGhost(ghostStartRef.current);
+        if (preservedOriginalSlice && preservedOriginalRange) {
+            const insertTr = editor.state.tr.replace(
+                preservedOriginalRange.from,
+                preservedOriginalRange.from,
+                preservedOriginalSlice,
+            );
+            insertTr.setSelection(TextSelection.create(
+                insertTr.doc,
+                preservedOriginalRange.from,
+                preservedOriginalRange.from + preservedOriginalSlice.size,
+            ));
+            editor.view.dispatch(insertTr);
+        }
+        restoreScrollPosition(preservedScrollTop);
+        ghostTextRef.current = '';
+        ghostStartRef.current = null;
+        ghostEndRef.current = null;
+        setPendingGhost(false);
+        // 触发新一轮生成（savedDocRef 保留不清空，供下次拒绝使用）
+        setTimeout(() => generate({
+            forcedMode: preservedMode,
+            forcedInstruction: preservedInstruction,
+            forcedAnchorPos: anchorPos,
+            forcedSelectedText: preservedOriginalText,
+            forcedSelectionRange: preservedOriginalRange,
+            skipReveal: true,
+            restoreScrollTop: preservedScrollTop,
+        }), 50);
+    }, [editor, generate, getScrollContainer, instruction, onArchiveGeneration, restoreScrollPosition, suppressAutoTrigger]);
+
+    useEffect(() => {
+        if (!editor) return;
+        const dom = editor.view.dom;
+        const handleCompositionStart = () => {
+            composingRef.current = true;
+            clearAutoTimer();
+        };
+        const handleCompositionEnd = () => {
+            composingRef.current = false;
+        };
+        dom.addEventListener('compositionstart', handleCompositionStart);
+        dom.addEventListener('compositionend', handleCompositionEnd);
+        return () => {
+            dom.removeEventListener('compositionstart', handleCompositionStart);
+            dom.removeEventListener('compositionend', handleCompositionEnd);
+        };
+    }, [clearAutoTimer, editor]);
+
+    useEffect(() => {
+        if (!editor || !autoCompleteEnabled) {
+            clearAutoTimer();
+            return;
+        }
+
+        const scheduleAutoComplete = ({ transaction }) => {
+            if (!transaction?.docChanged) return;
+            clearAutoTimer();
+            if (!shouldAutoTrigger()) return;
+
+            const signature = getAutoSignature();
+            autoTimerRef.current = setTimeout(() => {
+                if (!shouldAutoTrigger()) return;
+                lastAutoSignatureRef.current = signature;
+                generate({ forcedMode: 'continue', forcedInstruction: '', autoTriggered: true });
+            }, autoCompleteDelay);
+        };
+
+        const cancelAutoComplete = () => clearAutoTimer();
+
+        editor.on('update', scheduleAutoComplete);
+        editor.on('selectionUpdate', cancelAutoComplete);
+
+        return () => {
+            editor.off('update', scheduleAutoComplete);
+            editor.off('selectionUpdate', cancelAutoComplete);
+            clearAutoTimer();
+        };
+    }, [autoCompleteDelay, autoCompleteEnabled, clearAutoTimer, editor, generate, getAutoSignature, shouldAutoTrigger]);
 
     // 键盘快捷键：Ctrl+J 打开，Esc 关闭/拒绝，Tab 接受
     useEffect(() => {
         const handler = (e) => {
+            const isDirectTyping = !e.ctrlKey && !e.metaKey && !e.altKey
+                && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Enter');
+
+            if (streaming && activeAutocompleteRef.current && isDirectTyping) {
+                stop();
+                return;
+            }
+            if (pendingGhost && isDirectTyping) {
+                rejectGhost();
+                return;
+            }
             if ((e.ctrlKey || e.metaKey) && e.key === 'j') {
                 e.preventDefault();
                 if (pendingGhost) return;
@@ -925,9 +1190,33 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         }
     }, [chatMessages, chatAnswer]);
 
-    // 待确认状态时不显示浮窗，改为在幽灵文本末尾显示操作栏
-    if (!visible && !pendingGhost) {
+    // 待确认状态时不显示浮窗，自动补全生成中显示停止栏
+    if (!visible && !pendingGhost && !(streaming && activeAutocompleteRef.current)) {
         return null;
+    }
+
+    if (streaming && activeAutocompleteRef.current) {
+        let ghostPos = { top: 0, left: 0 };
+        try {
+            const head = ghostEndRef.current ?? ghostStartRef.current ?? editor.state.selection.head;
+            const coords = editor.view.coordsAtPos(head, -1);
+            ghostPos = { top: coords.bottom + 4, left: coords.left };
+            const vw = window.innerWidth;
+            if (ghostPos.left + 280 > vw) ghostPos.left = vw - 296;
+            if (ghostPos.left < 16) ghostPos.left = 16;
+        } catch { }
+
+        return (
+            <div
+                className="ghost-inline-bar"
+                style={{ top: Math.max(16, Math.min(ghostPos.top, window.innerHeight - 60)), left: ghostPos.left }}
+            >
+                <button className="ghost-reject-btn" onClick={stop} title="立即停止">
+                    ■ 停止
+                </button>
+                <span className="ghost-bar-shortcut">正在补全 · 最多 {autoCompleteMaxChars} 字</span>
+            </div>
+        );
     }
 
     // 待确认状态：在幽灵文本末尾内联显示操作栏（Cursor 风格）
@@ -935,7 +1224,7 @@ function InlineAI({ editor, onAiRequest, onArchiveGeneration, contextItems, cont
         // 获取光标位置（幽灵文本末尾）
         let ghostPos = { top: 0, left: 0 };
         try {
-            const head = editor.state.selection.head;
+            const head = ghostEndRef.current ?? ghostStartRef.current ?? editor.state.selection.head;
             const coords = editor.view.coordsAtPos(head, -1);
             ghostPos = { top: coords.bottom + 4, left: coords.left };
             // 确保不超出视口
@@ -1287,15 +1576,14 @@ const FONT_FAMILIES = [
 const FONT_SIZES = [12, 14, 15, 16, 17, 18, 20, 22, 24, 28, 32];
 
 // ==================== 工具栏 ====================
-function EditorToolbar({ editor, margins, setMargins }) {
-    if (!editor) return null;
-
+function EditorToolbar({ editor, margins, setMargins, aiAutoComplete, setAiAutoComplete }) {
     const [showFontColor, setShowFontColor] = useState(false);
     const [showBgColor, setShowBgColor] = useState(false);
     const [showFontFamily, setShowFontFamily] = useState(false);
     const [showFontSize, setShowFontSize] = useState(false);
     const [showTypeset, setShowTypeset] = useState(false);
     const [showMargins, setShowMargins] = useState(false);
+    const [showAiAssist, setShowAiAssist] = useState(false);
     const [fontSize, setFontSize] = useState(() => {
         if (typeof window !== 'undefined') return parseInt(localStorage.getItem('author-font-size')) || 17;
         return 17;
@@ -1319,6 +1607,7 @@ function EditorToolbar({ editor, margins, setMargins }) {
         setShowFontSize(false);
         setShowTypeset(false);
         setShowMargins(false);
+        setShowAiAssist(false);
     };
 
     const toolbarRef = useRef(null);
@@ -1331,6 +1620,8 @@ function EditorToolbar({ editor, margins, setMargins }) {
         return () => document.removeEventListener('click', handler);
     }, []);
 
+    if (!editor) return null;
+
     const currentFontFamily = editor.getAttributes('textStyle').fontFamily || '';
     const currentFontLabel = FONT_FAMILIES.find(f => f.value === currentFontFamily)?.label || '默认';
     const currentColor = editor.getAttributes('textStyle').color || '';
@@ -1340,6 +1631,78 @@ function EditorToolbar({ editor, margins, setMargins }) {
         <div className="editor-toolbar" onMouseDown={e => { if (e.target.tagName !== 'INPUT') e.preventDefault(); }}>
             {/* 编辑器 AI 模型切换器 */}
             <ModelPicker target="editor" dropDirection="down" />
+
+            <div className="toolbar-divider" />
+
+            <div className="toolbar-dropdown-wrap" onClick={e => e.stopPropagation()}>
+                <button
+                    className={`toolbar-btn toolbar-dropdown-btn ${aiAutoComplete?.enabled ? 'active' : ''}`}
+                    onClick={() => { closeAll(); setShowAiAssist(!showAiAssist); }}
+                    title="AI 自动补全"
+                >
+                    AI补全 <span className="dropdown-arrow">▾</span>
+                </button>
+                {showAiAssist && (
+                    <div className="typeset-popover" style={{ position: 'absolute', top: '100%', bottom: 'auto', left: 0, marginTop: 4, zIndex: 120, minWidth: 260 }}>
+                        <div className="typeset-row">
+                            <label>状态</label>
+                            <button
+                                className={`toolbar-btn ${aiAutoComplete?.enabled ? 'active' : ''}`}
+                                onClick={() => setAiAutoComplete(prev => ({ ...prev, enabled: !prev.enabled }))}
+                            >
+                                {aiAutoComplete?.enabled ? '已开启' : '已关闭'}
+                            </button>
+                        </div>
+                        <div className="typeset-row">
+                            <label>延迟</label>
+                            <input
+                                type="range"
+                                min="800"
+                                max="3000"
+                                step="100"
+                                value={aiAutoComplete?.delay || 1200}
+                                onChange={e => setAiAutoComplete(prev => ({ ...prev, delay: Number(e.target.value) }))}
+                            />
+                            <span className="typeset-value">{((aiAutoComplete?.delay || 1200) / 1000).toFixed(1)}s</span>
+                        </div>
+                        <div className="typeset-row">
+                            <label>字数上限</label>
+                            <input
+                                type="range"
+                                min="20"
+                                max="2000"
+                                step="20"
+                                value={aiAutoComplete?.maxChars || 90}
+                                onChange={e => setAiAutoComplete(prev => ({ ...prev, maxChars: Number(e.target.value) }))}
+                            />
+                            <input
+                                type="number"
+                                min="20"
+                                max="2000"
+                                step="10"
+                                value={aiAutoComplete?.maxChars || 90}
+                                onChange={e => {
+                                    const raw = parseInt(e.target.value || '0', 10);
+                                    const next = Number.isFinite(raw) ? Math.min(2000, Math.max(20, raw)) : 90;
+                                    setAiAutoComplete(prev => ({ ...prev, maxChars: next }));
+                                }}
+                                style={{
+                                    width: 76,
+                                    border: '1px solid var(--border)',
+                                    borderRadius: 8,
+                                    padding: '6px 8px',
+                                    background: 'var(--panel)',
+                                    color: 'var(--text-primary)',
+                                }}
+                            />
+                            <span className="typeset-value">字</span>
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                            停止输入后自动补全，支持句中插入，`Tab` 接受，`Esc` 拒绝。
+                        </div>
+                    </div>
+                )}
+            </div>
 
             <div className="toolbar-divider" />
 
@@ -1561,7 +1924,7 @@ function EditorToolbar({ editor, margins, setMargins }) {
 }
 
 // ==================== 状态栏 ====================
-function StatusBar({ editor, pageCount }) {
+function StatusBar({ editor, pageCount, aiAutoComplete }) {
     if (!editor) return null;
 
     const characterCount = editor.storage.characterCount;
@@ -1577,6 +1940,7 @@ function StatusBar({ editor, pageCount }) {
             </div>
             <div className="status-bar-right">
                 <span className="status-bar-shortcut">Ctrl+J AI助手</span>
+                <span>{aiAutoComplete?.enabled ? `AI补全 ${((aiAutoComplete.delay || 1200) / 1000).toFixed(1)}s / ${aiAutoComplete?.maxChars || 90}字` : 'AI补全 已关闭'}</span>
                 <span>自动保存</span>
                 <span style={{ opacity: 0.5, fontSize: '11px' }}>© 2026 YuanShiJiLoong</span>
             </div>

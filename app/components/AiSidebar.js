@@ -782,6 +782,7 @@ export default function AiSidebar({ onInsertText }) {
     ];
 
     const MODE_LABELS = {
+        autocomplete: '补全',
         continue: '续写',
         rewrite: '改写',
         expand: '扩写',

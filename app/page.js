@@ -278,7 +278,7 @@ export default function Home() {
   }, [activeChapterId, activeWorkId, updateChapterStore]);
 
   // Inline AI 回调：编辑器调用此函数发起 AI 请求
-  const handleInlineAiRequest = useCallback(async ({ mode, text, instruction, signal, onChunk }) => {
+  const handleInlineAiRequest = useCallback(async ({ mode, text, instruction, signal, onChunk, completionContext = null, maxChars = null }) => {
     const startTime = Date.now();
     let usageData = null;
     let fullText = '';
@@ -286,9 +286,13 @@ export default function Home() {
       // 使用上下文引擎收集项目信息
       const context = await buildContext(activeChapterId, text, contextSelection.size > 0 ? contextSelection : null);
       const systemPrompt = compileSystemPrompt(context, mode);
-      const userPrompt = compileUserPrompt(mode, text, instruction);
+      const userPrompt = compileUserPrompt(mode, text, instruction, { completionContext, maxChars });
 
       const { apiConfig } = getProjectSettings();
+      const inferredMaxTokens = maxChars ? Math.max(32, Math.ceil(maxChars * 2)) : null;
+      const requestedMaxTokens = apiConfig?.useAdvancedParams
+        ? Math.min(apiConfig.maxOutputTokens || 65536, inferredMaxTokens || (apiConfig.maxOutputTokens || 65536))
+        : inferredMaxTokens;
       const apiEndpoint = ['gemini-native', 'custom-gemini'].includes(apiConfig?.provider) ? '/api/ai/gemini'
         : apiConfig?.provider === 'openai-responses' ? '/api/ai/responses'
           : ['claude', 'custom-claude'].includes(apiConfig?.provider) ? '/api/ai/claude'
@@ -300,11 +304,11 @@ export default function Home() {
         body: JSON.stringify({
           systemPrompt, userPrompt, apiConfig,
           ...(apiConfig?.useAdvancedParams ? {
-            maxTokens: apiConfig.maxOutputTokens || 65536,
+            ...(requestedMaxTokens ? { maxTokens: requestedMaxTokens } : {}),
             temperature: apiConfig.temperature ?? 1,
             topP: apiConfig.topP ?? 0.95,
             reasoningEffort: apiConfig.reasoningEffort || 'auto',
-          } : {}),
+          } : requestedMaxTokens ? { maxTokens: requestedMaxTokens } : {}),
         }),
         signal,
       });
@@ -321,6 +325,8 @@ export default function Home() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      const hardCharLimit = Number.isFinite(maxChars) ? Math.max(1, maxChars) : null;
+      let reachedCharLimit = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -337,13 +343,34 @@ export default function Home() {
           if (trimmed.startsWith('data: ')) {
             try {
               const json = JSON.parse(trimmed.slice(6));
-              if (json.text) { fullText += json.text; onChunk(json.text); }
+              if (json.text) {
+                let chunk = json.text;
+                if (hardCharLimit != null) {
+                  const remaining = hardCharLimit - fullText.length;
+                  if (remaining <= 0) {
+                    reachedCharLimit = true;
+                    await reader.cancel().catch(() => { });
+                    break;
+                  }
+                  chunk = chunk.slice(0, remaining);
+                }
+                if (chunk) {
+                  fullText += chunk;
+                  onChunk(chunk);
+                }
+                if (hardCharLimit != null && fullText.length >= hardCharLimit) {
+                  reachedCharLimit = true;
+                  await reader.cancel().catch(() => { });
+                  break;
+                }
+              }
               if (json.usage) { usageData = json.usage; }
             } catch {
               // 解析失败跳过
             }
           }
         }
+        if (reachedCharLimit) break;
       }
 
       // 记录 token 统计

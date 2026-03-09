@@ -468,7 +468,9 @@ export function compileSystemPrompt(context, mode) {
 /**
  * 构建用户提示词
  */
-export function compileUserPrompt(mode, text, instruction) {
+export function compileUserPrompt(mode, text, instruction, options = {}) {
+    const completionContext = options?.completionContext || null;
+    const maxChars = options?.maxChars || null;
     switch (mode) {
         case 'continue':
             if (!text || !text.trim()) {
@@ -479,6 +481,31 @@ export function compileUserPrompt(mode, text, instruction) {
             return instruction
                 ? `请续写以下内容，保持风格和情节的连贯性：\n要求：${instruction}\n\n「${text}」`
                 : `请续写以下内容，保持风格和情节的连贯性：\n\n「${text}」`;
+        case 'autocomplete': {
+            const prefix = completionContext?.prefix || text || '';
+            const suffix = completionContext?.suffix || '';
+            const limitLine = maxChars ? `- 输出控制在 ${maxChars} 个字以内\n` : '';
+            const lengthStyle = maxChars && maxChars > 300
+                ? '- 可以补成一段完整内容，但仍需紧贴上下文\n'
+                : '- 优先补成一小段自然衔接的内容\n';
+            if (suffix.trim()) {
+                return `请在下面的“前文”和“后文”之间补全最自然的内容。
+要求：
+- 只输出应该插入的文本，不要解释，不要重复前文或后文
+- 补全文字要与前后句严密衔接，像作者原本就写在那里
+${lengthStyle}${limitLine}${instruction ? `- 额外要求：${instruction}\n` : ''}【前文】
+「${prefix}」
+
+【后文】
+「${suffix}」`;
+            }
+            return `请根据下面的前文继续补全后续内容。
+要求：
+- 只输出补全内容，不要解释
+- 风格、语气、节奏与前文保持一致
+${lengthStyle}${limitLine}${instruction ? `- 额外要求：${instruction}\n` : ''}【前文】
+「${prefix}」`;
+        }
         case 'rewrite':
             return instruction
                 ? `按照以下要求改写文本：\n要求：${instruction}\n\n原文：\n「${text}」`
@@ -641,6 +668,14 @@ function getModeInstruction(mode) {
 - 如果涉及已有角色，必须符合其性格设定和说话风格
 - 场景描写要符合世界观设定
 - 情节推进要符合大纲规划的方向`;
+
+        case 'autocomplete':
+            return `根据作品上下文，在作者当前光标位置补全文字。
+要求：
+- 如果提供了后文，输出必须能够无缝插入前文与后文之间
+- 只能输出应插入的补全文字，不能解释、不能复述上下文
+- 优先保持语气、节奏、措辞和人物口吻一致
+- 当用户允许较大字数时，可以补成更完整的一段，而不只是一两句`;
 
         case 'rewrite':
             return `润色和改写指定文本，提升文学质量。
